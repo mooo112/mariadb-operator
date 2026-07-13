@@ -5,6 +5,7 @@ import (
 
 	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
 	"github.com/stretchr/testify/assert"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 )
 
@@ -313,6 +314,90 @@ func TestGetReadOnlyDesiredPodState(t *testing.T) {
 				0: false,
 				1: false,
 				2: false,
+			},
+		},
+		{
+			name: "multi-cluster replica cluster",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "mariadb-eu-central",
+				},
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replicas: 3,
+					Replication: &mariadbv1alpha1.Replication{
+						Enabled: true,
+					},
+					MultiCluster: &mariadbv1alpha1.MultiCluster{
+						Enabled: true,
+						MultiClusterSpec: mariadbv1alpha1.MultiClusterSpec{
+							Primary: "mariadb-eu-south",
+						},
+					},
+				},
+				Status: mariadbv1alpha1.MariaDBStatus{
+					CurrentPrimaryPodIndex: ptr.To(0),
+				},
+			},
+			expectedState: map[int]bool{
+				0: true,
+				1: true,
+				2: true,
+			},
+		},
+		{
+			name: "multi-cluster replica cluster - primary at index 1",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "mariadb-eu-central",
+				},
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replicas: 3,
+					Replication: &mariadbv1alpha1.Replication{
+						Enabled: true,
+					},
+					MultiCluster: &mariadbv1alpha1.MultiCluster{
+						Enabled: true,
+						MultiClusterSpec: mariadbv1alpha1.MultiClusterSpec{
+							Primary: "mariadb-eu-south",
+						},
+					},
+				},
+				Status: mariadbv1alpha1.MariaDBStatus{
+					CurrentPrimaryPodIndex: ptr.To(1),
+				},
+			},
+			expectedState: map[int]bool{
+				0: true,
+				1: true,
+				2: true,
+			},
+		},
+		{
+			name: "multi-cluster primary cluster",
+			mariadb: &mariadbv1alpha1.MariaDB{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "mariadb-eu-south",
+				},
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					Replicas: 3,
+					Replication: &mariadbv1alpha1.Replication{
+						Enabled: true,
+					},
+					MultiCluster: &mariadbv1alpha1.MultiCluster{
+						Enabled: true,
+						MultiClusterSpec: mariadbv1alpha1.MultiClusterSpec{
+							Primary: "mariadb-eu-south",
+						},
+					},
+				},
+				Status: mariadbv1alpha1.MariaDBStatus{
+					CurrentPrimaryPodIndex: ptr.To(0),
+				},
+			},
+			expectedState: map[int]bool{
+				0: false,
+				1: true,
+				2: true,
 			},
 		},
 	}

@@ -73,7 +73,9 @@ func (r *MaintenanceReconciler) getReadOnlyDesiredPodState(mariadb *mariadbv1alp
 
 	for i := 0; i < int(mariadb.Spec.Replicas); i++ {
 		if mariadb.IsReplicationEnabled() {
-			if mariadb.Status.CurrentPrimaryPodIndex != nil && *mariadb.Status.CurrentPrimaryPodIndex == i {
+			if mariadb.IsMultiClusterReplica() {
+				desiredReadOnlyPodState[i] = true
+			} else if mariadb.Status.CurrentPrimaryPodIndex != nil && *mariadb.Status.CurrentPrimaryPodIndex == i {
 				desiredReadOnlyPodState[i] = desiredReadOnly
 			} else {
 				desiredReadOnlyPodState[i] = true

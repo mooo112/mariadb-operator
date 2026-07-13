@@ -338,7 +338,7 @@ func (m *multiClusterTopology) configurePrimaryReplica(ctx context.Context, clie
 		return fmt.Errorf("error resetting local slave: %v", err)
 	}
 
-	if err := client.DisableReadOnly(ctx); err != nil {
+	if err := client.EnableReadOnly(ctx); err != nil {
 		return fmt.Errorf("error disabling read_only: %v", err)
 	}
 	if err := m.userSqlReconciler.reconcileReplUserSql(ctx, client); err != nil {

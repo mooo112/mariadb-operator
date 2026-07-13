@@ -136,9 +136,11 @@ func (r *ReplicationReconciler) reconcileStaleSwitchover(ctx context.Context, re
 		return fmt.Errorf("error unlocking primary: %v", err)
 	}
 
-	logger.Info("Disabling readonly in primary")
-	if err := currentPrimaryClient.DisableReadOnly(ctx); err != nil {
-		return fmt.Errorf("error disabling readonly in primary: %v", err)
+	if !req.mariadb.IsMultiClusterReplica() {
+		logger.Info("Disabling readonly in primary")
+		if err := currentPrimaryClient.DisableReadOnly(ctx); err != nil {
+			return fmt.Errorf("error disabling readonly in primary: %v", err)
+		}
 	}
 
 	if err := r.patchStatus(ctx, req.mariadb, func(status *mariadbv1alpha1.MariaDBStatus) {

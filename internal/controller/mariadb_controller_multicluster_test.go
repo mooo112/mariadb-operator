@@ -946,6 +946,8 @@ func testReplicationStatusBuilder(primaryKey, replicaKey types.NamespacedName,
 		testGtidCurrentPos(*primaryClient, primaryGtidDomainId)
 		By("Ensuring primary replication running")
 		testReplicationRunning(*primaryClient, nil)
+		By("Ensuring primary cluster replica is read-only")
+		testReadOnly(*primaryClient, true)
 
 		By("Getting primary replica MariaDB client")
 		Expect(k8sClient.Get(testCtx, replicaKey, &replicaMdb)).To(Succeed())
@@ -960,6 +962,8 @@ func testReplicationStatusBuilder(primaryKey, replicaKey types.NamespacedName,
 		testGtidCurrentPos(*primaryReplicaClient, primaryGtidDomainId, replicaGtidDomainId)
 		By("Ensuring primary replica replication running")
 		testReplicationRunning(*primaryReplicaClient, &replicationctrl.MultiClusterReplicaConnectionName)
+		By("Ensuring primary replica is read-only")
+		testReadOnly(*primaryReplicaClient, true)
 
 		By("Getting replica MariaDB client")
 		Expect(k8sClient.Get(testCtx, replicaKey, &replicaMdb)).To(Succeed())
@@ -981,6 +985,8 @@ func testReplicationStatusBuilder(primaryKey, replicaKey types.NamespacedName,
 		testGtidCurrentPos(*replicaClient, primaryGtidDomainId, replicaGtidDomainId)
 		By("Ensuring replica replication running")
 		testReplicationRunning(*replicaClient, nil)
+		By("Ensuring replica is read-only")
+		testReadOnly(*replicaClient, true)
 	}
 }
 
@@ -1111,5 +1117,13 @@ func testReplicationRunning(client sql.Client, connectionName *string) {
 			ptr.Deref(status.LastSQLErrno, -1) == 0 &&
 			ptr.Deref(status.LastIOErrno, -1) == 0 &&
 			ptr.Deref(status.SecondsBehindMaster, -1) == 0
+	}, testTimeout, testInterval).Should(BeTrue())
+}
+
+func testReadOnly(client sql.Client, expected bool) {
+	Eventually(func(g Gomega) bool {
+		readOnly, err := client.GetReadOnly(testCtx)
+		g.Expect(err).To(Succeed())
+		return readOnly == expected
 	}, testTimeout, testInterval).Should(BeTrue())
 }
