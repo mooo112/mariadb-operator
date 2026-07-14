@@ -56,23 +56,39 @@ func (r *userSqlReconciler) reconcileReplUserSql(ctx context.Context, client *sq
 	if err != nil {
 		return fmt.Errorf("error checking if replication user exists: %v", err)
 	}
+	// Only issue DCL when the actual state differs. Unconditional ALTER USER/GRANT statements are
+	// binlogged (even when they are no-ops) with the executing server's own gtid_domain_id: on a
+	// replica cluster this mints GTIDs that exist on no primary, breaking later re-homing, and it
+	// writes the replication password in clear text to the binlog on every reconciliation.
 	if exists {
-		if err := client.AlterUser(ctx, accountName, sql.WithIdentifiedBy(replPassword)); err != nil {
-			return fmt.Errorf("error altering replication user: %v", err)
+		passwordMatches, err := client.UserPasswordMatches(ctx, opts.username, opts.host, replPassword)
+		if err != nil {
+			return fmt.Errorf("error checking replication user password: %v", err)
+		}
+		if !passwordMatches {
+			if err := client.AlterUser(ctx, accountName, sql.WithIdentifiedBy(replPassword)); err != nil {
+				return fmt.Errorf("error altering replication user: %v", err)
+			}
 		}
 	} else {
 		if err := client.CreateUser(ctx, accountName, sql.WithIdentifiedBy(replPassword)); err != nil {
 			return fmt.Errorf("error creating replication user: %v", err)
 		}
 	}
-	if err := client.Grant(
-		ctx,
-		opts.privileges,
-		"*",
-		"*",
-		accountName,
-	); err != nil {
-		return fmt.Errorf("error creating grant: %v", err)
+	hasPrivileges, err := client.UserHasGlobalPrivileges(ctx, opts.username, opts.host, opts.privileges)
+	if err != nil {
+		return fmt.Errorf("error checking replication user privileges: %v", err)
+	}
+	if !hasPrivileges {
+		if err := client.Grant(
+			ctx,
+			opts.privileges,
+			"*",
+			"*",
+			accountName,
+		); err != nil {
+			return fmt.Errorf("error creating grant: %v", err)
+		}
 	}
 	return nil
 }

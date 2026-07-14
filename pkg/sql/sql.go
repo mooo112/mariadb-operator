@@ -572,6 +572,75 @@ func (c *Client) UserExists(ctx context.Context, username, host string) (bool, e
 	return count > 0, nil
 }
 
+// UserPasswordMatches checks whether the account's stored password hash already matches the given
+// plain-text password. The hash is computed server-side via PASSWORD(), so the plain-text password
+// never appears in a DDL/DCL statement (SELECTs are not binlogged).
+func (c *Client) UserPasswordMatches(ctx context.Context, username, host, password string) (bool, error) {
+	row := c.db.QueryRowContext(
+		ctx,
+		"SELECT COUNT(*) FROM mysql.user WHERE user=? AND host=? AND password=PASSWORD(?)",
+		username, host, password,
+	)
+	var count int
+	if err := row.Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// privilegeAliases maps privileges to their alternative spelling, as information_schema may report
+// either form depending on the server version (e.g. REPLICATION REPLICA vs REPLICATION SLAVE).
+var privilegeAliases = map[string]string{
+	"REPLICATION REPLICA": "REPLICATION SLAVE",
+	"REPLICATION SLAVE":   "REPLICATION REPLICA",
+	"BINLOG MONITOR":      "REPLICATION CLIENT",
+	"REPLICATION CLIENT":  "BINLOG MONITOR",
+}
+
+// containsAllPrivileges checks whether every wanted privilege (or its alias) is present in granted.
+func containsAllPrivileges(granted map[string]struct{}, wanted []string) bool {
+	for _, priv := range wanted {
+		priv = strings.ToUpper(priv)
+		if _, ok := granted[priv]; ok {
+			continue
+		}
+		if alias, hasAlias := privilegeAliases[priv]; hasAlias {
+			if _, ok := granted[alias]; ok {
+				continue
+			}
+		}
+		return false
+	}
+	return true
+}
+
+// UserHasGlobalPrivileges checks whether the account already holds all the given global (*.*) privileges.
+func (c *Client) UserHasGlobalPrivileges(ctx context.Context, username, host string, privileges []string) (bool, error) {
+	grantee := fmt.Sprintf("'%s'@'%s'", username, host)
+	rows, err := c.db.QueryContext(
+		ctx,
+		"SELECT PRIVILEGE_TYPE FROM information_schema.USER_PRIVILEGES WHERE GRANTEE=?",
+		grantee,
+	)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close() //nolint:errcheck
+
+	granted := make(map[string]struct{})
+	for rows.Next() {
+		var priv string
+		if err := rows.Scan(&priv); err != nil {
+			return false, err
+		}
+		granted[strings.ToUpper(priv)] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return containsAllPrivileges(granted, privileges), nil
+}
+
 type grantOpts struct {
 	grantOption bool
 }

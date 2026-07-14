@@ -233,3 +233,63 @@ func TestRequireQuery(t *testing.T) {
 		})
 	}
 }
+
+func TestContainsAllPrivileges(t *testing.T) {
+	granted := func(privs ...string) map[string]struct{} {
+		m := make(map[string]struct{}, len(privs))
+		for _, p := range privs {
+			m[p] = struct{}{}
+		}
+		return m
+	}
+	tests := []struct {
+		name    string
+		granted map[string]struct{}
+		wanted  []string
+		want    bool
+	}{
+		{
+			name:    "exact match",
+			granted: granted("REPLICATION REPLICA"),
+			wanted:  []string{"REPLICATION REPLICA"},
+			want:    true,
+		},
+		{
+			name:    "alias match",
+			granted: granted("REPLICATION SLAVE"),
+			wanted:  []string{"REPLICATION REPLICA"},
+			want:    true,
+		},
+		{
+			name:    "case insensitive wanted",
+			granted: granted("REPLICATION SLAVE"),
+			wanted:  []string{"replication replica"},
+			want:    true,
+		},
+		{
+			name:    "missing privilege",
+			granted: granted("USAGE"),
+			wanted:  []string{"REPLICATION REPLICA"},
+			want:    false,
+		},
+		{
+			name:    "one of several missing",
+			granted: granted("REPLICATION SLAVE"),
+			wanted:  []string{"REPLICATION REPLICA", "BINLOG MONITOR"},
+			want:    false,
+		},
+		{
+			name:    "empty wanted",
+			granted: granted(),
+			wanted:  nil,
+			want:    true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := containsAllPrivileges(tt.granted, tt.wanted); got != tt.want {
+				t.Errorf("containsAllPrivileges() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
