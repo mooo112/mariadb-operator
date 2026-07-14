@@ -283,6 +283,15 @@ func requeueResult(ctx context.Context, mdb *mariadbv1alpha1.MariaDB) (ctrl.Resu
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
+	if mdb.IsReplicationEnabled() {
+		// Replication health (thread state, roles in status.replication) is only observed during
+		// reconciles, and a stopped or broken replication connection emits no Kubernetes event:
+		// without a periodic requeue it goes undetected — and unrepaired — until an unrelated
+		// event happens to trigger reconciliation, while the status reports stale thread states.
+		log.FromContext(ctx).V(1).Info("Requeuing MariaDB to observe replication health")
+		return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
+	}
+
 	if mdb.IsTLSEnabled() {
 		log.FromContext(ctx).V(1).Info("Requeuing MariaDB")
 		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil // ensure certificates get renewed
