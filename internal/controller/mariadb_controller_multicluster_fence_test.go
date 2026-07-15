@@ -3,8 +3,52 @@ package controller
 import (
 	"testing"
 
+	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/metadata"
 	"github.com/stretchr/testify/assert"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+func TestIsPromotionForced(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		expected    bool
+	}{
+		{
+			name:        "no annotations",
+			annotations: nil,
+			expected:    false,
+		},
+		{
+			name:        "annotation set",
+			annotations: map[string]string{metadata.ForcePromoteAnnotation: "true"},
+			expected:    true,
+		},
+		{
+			// only an explicit "true" skips the fence: an empty or arbitrary value must not
+			// accidentally forfeit it
+			name:        "annotation with non-true value",
+			annotations: map[string]string{metadata.ForcePromoteAnnotation: "yes"},
+			expected:    false,
+		},
+		{
+			name:        "annotation with empty value",
+			annotations: map[string]string{metadata.ForcePromoteAnnotation: ""},
+			expected:    false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mdb := &mariadbv1alpha1.MariaDB{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: tt.annotations,
+				},
+			}
+			assert.Equal(t, tt.expected, isPromotionForced(mdb))
+		})
+	}
+}
 
 func TestFilterOutDomain(t *testing.T) {
 	tests := []struct {

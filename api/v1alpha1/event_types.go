@@ -46,6 +46,13 @@ const (
 	// ReasonPrimarySwitched indicates that primary has been switched.
 	ReasonPrimarySwitched = "PrimarySwitched"
 
+	// ReasonMultiClusterPromotionFenced indicates that a cluster-level promotion is fenced until it is safe.
+	ReasonMultiClusterPromotionFenced = "MultiClusterPromotionFenced"
+	// ReasonMultiClusterPromotionForced indicates that a cluster-level promotion skipped the catch-up fence.
+	ReasonMultiClusterPromotionForced = "MultiClusterPromotionForced"
+	// ReasonMultiClusterPrimarySwitched indicates that the multi-cluster primary has been switched.
+	ReasonMultiClusterPrimarySwitched = "MultiClusterPrimarySwitched"
+
 	// ReasonMaxScalePrimaryServerChanged indicates that the primary server managed by MaxScale has changed.
 	ReasonMaxScalePrimaryServerChanged = "MaxScalePrimaryServerChanged"
 

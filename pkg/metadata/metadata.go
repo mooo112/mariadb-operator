@@ -27,5 +27,12 @@ var (
 
 	WebhookConfigAnnotation = "k8s.mariadb.com/webhook"
 
+	// ForcePromoteAnnotation, when set to "true" on a MariaDB, skips the multi-cluster promotion
+	// catch-up fence: the cluster is promoted without verifying it applied everything the outgoing
+	// primary binlogged. Intended for unplanned failover (outgoing primary unreachable or its
+	// operator down); writes not yet replicated from the outgoing primary are lost on the promoted
+	// cluster. The annotation is consumed (removed) once the promotion completes.
+	ForcePromoteAnnotation = "k8s.mariadb.com/force-promote"
+
 	MetaCtrlFieldPath = ".metadata.controller"
 )

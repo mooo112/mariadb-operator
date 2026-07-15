@@ -1014,6 +1014,22 @@ func testMultiClusterSwitchoverBuilder(primaryGtidDomainId, replicaGtidDomainId 
 			return mdb.IsReady()
 		})
 
+		// The promotion fence requires the outgoing primary to report read_only=1 before its
+		// gtid_binlog_pos is trusted: follow the documented runbook and put the primary cluster
+		// in read-only maintenance mode before promoting the replica cluster.
+		By("Enabling read-only maintenance mode on primary cluster")
+		Eventually(func(g Gomega) bool {
+			if err := k8sClient.Get(testCtx, primaryKey, primaryMdb); err != nil {
+				return false
+			}
+			primaryMdb.Spec.Maintenance = &mariadbv1alpha1.MariaDBMaintenance{
+				Enabled:  true,
+				ReadOnly: true,
+			}
+			g.Expect(k8sClient.Update(testCtx, primaryMdb)).To(Succeed())
+			return true
+		}, testTimeout, testInterval).Should(BeTrue())
+
 		By("Promoting replica cluster")
 		Eventually(func(g Gomega) bool {
 			if err := k8sClient.Get(testCtx, replicaKey, replicaMdb); err != nil {
@@ -1078,6 +1094,17 @@ func testMultiClusterSwitchoverBuilder(primaryGtidDomainId, replicaGtidDomainId 
 				Fields{
 					"DomainID": BeEquivalentTo(replicaGtidDomainId),
 				})))
+			return true
+		}, testTimeout, testInterval).Should(BeTrue())
+
+		// runbook step 5: lift maintenance mode once the switchover completed
+		By("Disabling maintenance mode on demoted cluster")
+		Eventually(func(g Gomega) bool {
+			if err := k8sClient.Get(testCtx, primaryKey, primaryMdb); err != nil {
+				return false
+			}
+			primaryMdb.Spec.Maintenance = nil
+			g.Expect(k8sClient.Update(testCtx, primaryMdb)).To(Succeed())
 			return true
 		}, testTimeout, testInterval).Should(BeTrue())
 	}

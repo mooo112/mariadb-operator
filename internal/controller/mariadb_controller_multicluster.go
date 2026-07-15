@@ -9,8 +9,10 @@ import (
 	"github.com/go-logr/logr"
 	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
 	replicationctrl "github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/replication"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/metadata"
 	"github.com/mariadb-operator/mariadb-operator/v26/pkg/replication"
 	"github.com/mariadb-operator/mariadb-operator/v26/pkg/sql"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -46,16 +48,27 @@ func (r *MariaDBReconciler) reconcileMultiCluster(ctx context.Context, mdb *mari
 		})
 	}
 	if primary == currentPrimary {
-		return ctrl.Result{}, nil
+		// consume stale force-promote annotations so a leftover cannot silently
+		// forfeit the fence of a future promotion
+		return ctrl.Result{}, r.clearForcePromote(ctx, mdb, logger)
 	}
 
 	if mdb.IsMultiClusterPrimary() {
-		caughtUp, err := r.waitForSwitchoverCatchUp(ctx, mdb, currentPrimary, logger)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("error waiting for switchover catch-up: %v", err)
-		}
-		if !caughtUp {
-			return ctrl.Result{RequeueAfter: multiClusterCatchUpRequeue}, nil
+		forced := isPromotionForced(mdb)
+		if forced {
+			r.Recorder.Eventf(mdb, nil, corev1.EventTypeWarning, mariadbv1alpha1.ReasonMultiClusterPromotionForced,
+				mariadbv1alpha1.ActionReconciling,
+				"Promotion forced via the %s annotation: catch-up fence skipped. Writes not yet replicated from '%s' are lost on this cluster",
+				metadata.ForcePromoteAnnotation, currentPrimary)
+			logger.Info("Promotion forced, skipping catch-up fence", "member", currentPrimary)
+		} else {
+			caughtUp, err := r.waitForSwitchoverCatchUp(ctx, mdb, currentPrimary, logger)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("error waiting for switchover catch-up: %v", err)
+			}
+			if !caughtUp {
+				return ctrl.Result{RequeueAfter: multiClusterCatchUpRequeue}, nil
+			}
 		}
 		if err := r.resetPrimaryReplicaConnection(ctx, mdb, logger); err != nil {
 			return ctrl.Result{}, fmt.Errorf("error resetting primary replica connection: %v", err)
@@ -66,8 +79,34 @@ func (r *MariaDBReconciler) reconcileMultiCluster(ctx context.Context, mdb *mari
 		}
 	}
 
-	return ctrl.Result{}, r.patchStatus(ctx, mdb, func(status *mariadbv1alpha1.MariaDBStatus) error {
+	if err := r.patchStatus(ctx, mdb, func(status *mariadbv1alpha1.MariaDBStatus) error {
 		status.CurrentMultiClusterPrimary = &primary
+		return nil
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	r.Recorder.Eventf(mdb, nil, corev1.EventTypeNormal, mariadbv1alpha1.ReasonMultiClusterPrimarySwitched,
+		mariadbv1alpha1.ActionReconciling,
+		"Multi-cluster primary switched from '%s' to '%s'", currentPrimary, primary)
+	return ctrl.Result{}, r.clearForcePromote(ctx, mdb, logger)
+}
+
+// isPromotionForced indicates whether the user explicitly requested to skip the promotion
+// catch-up fence (unplanned failover / disaster recovery).
+func isPromotionForced(mdb *mariadbv1alpha1.MariaDB) bool {
+	return mdb.Annotations[metadata.ForcePromoteAnnotation] == "true"
+}
+
+// clearForcePromote consumes the force-promote annotation. Forcing is a one-shot, per-switchover
+// decision: leaving the annotation behind would silently disable the fence for future promotions.
+func (r *MariaDBReconciler) clearForcePromote(ctx context.Context, mdb *mariadbv1alpha1.MariaDB,
+	logger logr.Logger) error {
+	if _, ok := mdb.Annotations[metadata.ForcePromoteAnnotation]; !ok {
+		return nil
+	}
+	logger.Info("Removing force-promote annotation", "annotation", metadata.ForcePromoteAnnotation)
+	return r.patch(ctx, mdb, func(mdb *mariadbv1alpha1.MariaDB) error {
+		delete(mdb.Annotations, metadata.ForcePromoteAnnotation)
 		return nil
 	})
 }
@@ -142,8 +181,10 @@ func (r *MariaDBReconciler) reconfigureReplicaClusterGtids(ctx context.Context, 
 // replicating from the outgoing primary, it must have applied everything the outgoing primary has
 // binlogged. Promoting with an un-applied tail permanently loses those writes on the promoted
 // cluster and diverges the datasets (e.g. duplicate auto-increment keys once writes resume).
-// If the outgoing primary is unreachable (unplanned failover / site down), the fence cannot be
-// evaluated and the promotion proceeds; the potentially lost tail is logged as such.
+// The fence fails closed: if the outgoing primary cannot be verified (unreachable, probe errors),
+// the promotion stays fenced rather than silently degrading a planned switchover into
+// unplanned-failover semantics. Unplanned failover is an explicit, human decision: setting the
+// force-promote annotation skips the fence and accepts the loss of the un-replicated tail.
 func (r *MariaDBReconciler) waitForSwitchoverCatchUp(ctx context.Context, mdb *mariadbv1alpha1.MariaDB,
 	outgoingPrimary string, logger logr.Logger) (bool, error) {
 	if !mdb.IsReplicationEnabled() {
@@ -151,12 +192,12 @@ func (r *MariaDBReconciler) waitForSwitchoverCatchUp(ctx context.Context, mdb *m
 	}
 	externalClient, err := r.getExternalMemberClient(ctx, mdb, outgoingPrimary)
 	if err != nil {
+		r.eventPromotionFencedUnverifiable(mdb, outgoingPrimary)
 		logger.Info(
-			"Outgoing multi-cluster primary is not reachable, promoting without catch-up fence. "+
-				"Writes not yet replicated from it are lost on this cluster.",
+			"Promotion fenced: outgoing multi-cluster primary is not reachable, requeuing...",
 			"member", outgoingPrimary, "error", err.Error(),
 		)
-		return true, nil
+		return false, nil
 	}
 	defer externalClient.Close()
 
@@ -167,14 +208,17 @@ func (r *MariaDBReconciler) waitForSwitchoverCatchUp(ctx context.Context, mdb *m
 	// the outgoing primary is read_only, then its gtid_binlog_pos is frozen and the wait is exact.
 	readOnly, err := externalClient.GetReadOnly(ctx)
 	if err != nil {
+		r.eventPromotionFencedUnverifiable(mdb, outgoingPrimary)
 		logger.Info(
-			"Unable to get read_only from outgoing multi-cluster primary, promoting without catch-up fence. "+
-				"Writes not yet replicated from it are lost on this cluster.",
+			"Promotion fenced: unable to get read_only from outgoing multi-cluster primary, requeuing...",
 			"member", outgoingPrimary, "error", err.Error(),
 		)
-		return true, nil
+		return false, nil
 	}
 	if !readOnly {
+		r.Recorder.Eventf(mdb, nil, corev1.EventTypeNormal, mariadbv1alpha1.ReasonMultiClusterPromotionFenced,
+			mariadbv1alpha1.ActionReconciling,
+			"Promotion fenced: outgoing primary '%s' is still writable (read_only=0)", outgoingPrimary)
 		logger.Info(
 			"Promotion fenced: outgoing multi-cluster primary is still writable (read_only=0), requeuing...",
 			"member", outgoingPrimary,
@@ -184,12 +228,12 @@ func (r *MariaDBReconciler) waitForSwitchoverCatchUp(ctx context.Context, mdb *m
 
 	outgoingPos, err := externalClient.GtidBinlogPos(ctx)
 	if err != nil {
+		r.eventPromotionFencedUnverifiable(mdb, outgoingPrimary)
 		logger.Info(
-			"Unable to get gtid_binlog_pos from outgoing multi-cluster primary, promoting without catch-up fence. "+
-				"Writes not yet replicated from it are lost on this cluster.",
+			"Promotion fenced: unable to get gtid_binlog_pos from outgoing multi-cluster primary, requeuing...",
 			"member", outgoingPrimary, "error", err.Error(),
 		)
-		return true, nil
+		return false, nil
 	}
 	if outgoingPos == "" {
 		return true, nil
@@ -220,6 +264,9 @@ func (r *MariaDBReconciler) waitForSwitchoverCatchUp(ctx context.Context, mdb *m
 
 	err = primaryClient.WaitForReplicaGtid(ctx, waitPos, multiClusterCatchUpTimeout)
 	if errors.Is(err, sql.ErrWaitReplicaTimeout) {
+		r.Recorder.Eventf(mdb, nil, corev1.EventTypeNormal, mariadbv1alpha1.ReasonMultiClusterPromotionFenced,
+			mariadbv1alpha1.ActionReconciling,
+			"Promotion fenced: not yet caught up with outgoing primary '%s'", outgoingPrimary)
 		logger.Info(
 			"Promotion fenced: not yet caught up with outgoing multi-cluster primary, requeuing...",
 			"member", outgoingPrimary, "gtid", waitPos,
@@ -234,6 +281,19 @@ func (r *MariaDBReconciler) waitForSwitchoverCatchUp(ctx context.Context, mdb *m
 		"member", outgoingPrimary, "gtid", waitPos,
 	)
 	return true, nil
+}
+
+// eventPromotionFencedUnverifiable records that a promotion is fenced because the outgoing
+// primary cannot be verified. Warning severity: this needs a human — either the outgoing site
+// recovers (planned switchover resumes) or the user forces the promotion (unplanned failover).
+// The event message is kept stable (no error string) so Kubernetes aggregates repeats.
+func (r *MariaDBReconciler) eventPromotionFencedUnverifiable(mdb *mariadbv1alpha1.MariaDB, outgoingPrimary string) {
+	r.Recorder.Eventf(mdb, nil, corev1.EventTypeWarning, mariadbv1alpha1.ReasonMultiClusterPromotionFenced,
+		mariadbv1alpha1.ActionReconciling,
+		"Promotion fenced: outgoing primary '%s' cannot be verified. "+
+			"If it is permanently gone (unplanned failover), annotate this MariaDB with %s=\"true\" to force the promotion, "+
+			"losing writes not yet replicated from it",
+		outgoingPrimary, metadata.ForcePromoteAnnotation)
 }
 
 // filterOutDomain drops the GTIDs of the given replication domain from a GTID position.

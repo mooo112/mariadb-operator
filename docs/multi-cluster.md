@@ -563,7 +563,15 @@ See the [galera-maxscale example](../examples/manifests/multi-cluster/galera-max
 
 Cluster switchover is the process of promoting a replica cluster to become the new primary. This is useful for disaster recovery, migrations, or blue-green deployments. In multi-region HA setups, cluster switchover is also used for failover, when a region becomes unavailable. In blue-green deployments, cluster switchover is used to switch traffic from the old cluster to the newly upgraded cluster.
 
-The operator fences the promotion: the to-be-promoted cluster is only promoted once the outgoing primary reports `read_only=1` (writes stopped) and every write it binlogged has been applied locally (`MASTER_GTID_WAIT`). Until then, the promotion is requeued — a planned switchover therefore loses no writes, even without draining first. If the outgoing primary is unreachable (unplanned failover, region down), the fence cannot be evaluated: the promotion proceeds and the operator logs that writes not yet replicated from the outgoing primary are lost on the promoted cluster.
+The operator fences the promotion: the to-be-promoted cluster is only promoted once the outgoing primary reports `read_only=1` (writes stopped) and every write it binlogged has been applied locally (`MASTER_GTID_WAIT`). Until then, the promotion is requeued and a `MultiClusterPromotionFenced` event is emitted — a planned switchover therefore loses no writes, even without draining first.
+
+The fence fails closed: if the outgoing primary cannot be verified (unreachable, probe errors), the promotion stays fenced rather than silently degrading a planned switchover into a lossy one. When the outgoing primary is permanently gone (unplanned failover, region down), force the promotion explicitly:
+
+```bash
+kubectl annotate mariadb <new-primary> k8s.mariadb.com/force-promote=true
+```
+
+The annotation skips the catch-up fence for a single promotion and is removed automatically once it completes; writes not yet replicated from the outgoing primary are lost on the promoted cluster (a `MultiClusterPromotionForced` warning event records this). When the outgoing cluster returns, its un-replicated writes surface as replication error 1236 (see below).
 
 Clusters keep their full multi-domain GTID state across switchovers, and a re-homing cluster resumes replication from its own `gtid_current_pos`. Writes that never replicated before an unplanned failover therefore surface as replication error 1236 on the returning cluster's `multi-cluster` connection — a deliberate, loud signal of divergence. Recover by re-provisioning the diverged cluster from the new primary (e.g. via `bootstrapFrom`), after salvaging any needed rows from its binlog.
 
