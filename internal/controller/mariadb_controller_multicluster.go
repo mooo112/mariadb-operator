@@ -2,15 +2,26 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	"github.com/go-logr/logr"
 	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
 	replicationctrl "github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/replication"
+	"github.com/mariadb-operator/mariadb-operator/v26/pkg/replication"
 	"github.com/mariadb-operator/mariadb-operator/v26/pkg/sql"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+const (
+	// multiClusterCatchUpTimeout bounds the in-reconcile wait for the to-be-promoted cluster to
+	// apply the outgoing primary's binlog; when exceeded, the promotion is requeued.
+	multiClusterCatchUpTimeout = 30 * time.Second
+	// multiClusterCatchUpRequeue is the requeue interval while the promotion is fenced.
+	multiClusterCatchUpRequeue = 10 * time.Second
 )
 
 func (r *MariaDBReconciler) reconcileMultiCluster(ctx context.Context, mdb *mariadbv1alpha1.MariaDB) (ctrl.Result, error) {
@@ -39,6 +50,13 @@ func (r *MariaDBReconciler) reconcileMultiCluster(ctx context.Context, mdb *mari
 	}
 
 	if mdb.IsMultiClusterPrimary() {
+		caughtUp, err := r.waitForSwitchoverCatchUp(ctx, mdb, currentPrimary, logger)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("error waiting for switchover catch-up: %v", err)
+		}
+		if !caughtUp {
+			return ctrl.Result{RequeueAfter: multiClusterCatchUpRequeue}, nil
+		}
 		if err := r.resetPrimaryReplicaConnection(ctx, mdb, logger); err != nil {
 			return ctrl.Result{}, fmt.Errorf("error resetting primary replica connection: %v", err)
 		}
@@ -118,6 +136,136 @@ func (r *MariaDBReconciler) reconfigureReplicaClusterGtids(ctx context.Context, 
 		return fmt.Errorf("error starting primary replica: %v", err)
 	}
 	return nil
+}
+
+// waitForSwitchoverCatchUp fences a cluster promotion: before the to-be-promoted cluster stops
+// replicating from the outgoing primary, it must have applied everything the outgoing primary has
+// binlogged. Promoting with an un-applied tail permanently loses those writes on the promoted
+// cluster and diverges the datasets (e.g. duplicate auto-increment keys once writes resume).
+// If the outgoing primary is unreachable (unplanned failover / site down), the fence cannot be
+// evaluated and the promotion proceeds; the potentially lost tail is logged as such.
+func (r *MariaDBReconciler) waitForSwitchoverCatchUp(ctx context.Context, mdb *mariadbv1alpha1.MariaDB,
+	outgoingPrimary string, logger logr.Logger) (bool, error) {
+	if !mdb.IsReplicationEnabled() {
+		return true, nil
+	}
+	externalClient, err := r.getExternalMemberClient(ctx, mdb, outgoingPrimary)
+	if err != nil {
+		logger.Info(
+			"Outgoing multi-cluster primary is not reachable, promoting without catch-up fence. "+
+				"Writes not yet replicated from it are lost on this cluster.",
+			"member", outgoingPrimary, "error", err.Error(),
+		)
+		return true, nil
+	}
+	defer externalClient.Close()
+
+	// The outgoing primary's position is only trustworthy once it stopped taking writes: its own
+	// demotion (a separate CR, reconciled by its own operator) sets read_only. Snapshotting the
+	// position while it is still writable races with in-flight writes — anything committed between
+	// snapshot and read_only would be silently lost on this cluster after promotion. Fence until
+	// the outgoing primary is read_only, then its gtid_binlog_pos is frozen and the wait is exact.
+	readOnly, err := externalClient.GetReadOnly(ctx)
+	if err != nil {
+		logger.Info(
+			"Unable to get read_only from outgoing multi-cluster primary, promoting without catch-up fence. "+
+				"Writes not yet replicated from it are lost on this cluster.",
+			"member", outgoingPrimary, "error", err.Error(),
+		)
+		return true, nil
+	}
+	if !readOnly {
+		logger.Info(
+			"Promotion fenced: outgoing multi-cluster primary is still writable (read_only=0), requeuing...",
+			"member", outgoingPrimary,
+		)
+		return false, nil
+	}
+
+	outgoingPos, err := externalClient.GtidBinlogPos(ctx)
+	if err != nil {
+		logger.Info(
+			"Unable to get gtid_binlog_pos from outgoing multi-cluster primary, promoting without catch-up fence. "+
+				"Writes not yet replicated from it are lost on this cluster.",
+			"member", outgoingPrimary, "error", err.Error(),
+		)
+		return true, nil
+	}
+	if outgoingPos == "" {
+		return true, nil
+	}
+
+	primaryClient, err := sql.NewInternalClientWithPodIndex(ctx, mdb, r.RefResolver, *mdb.Status.CurrentPrimaryPodIndex)
+	if err != nil {
+		return false, fmt.Errorf("error getting primary client: %v", err)
+	}
+	defer primaryClient.Close()
+
+	// Wait only on domains FOREIGN to this cluster. The outgoing primary's gtid_binlog_pos also
+	// contains this cluster's own domain (its writes, relayed back), but gtid_slave_pos does not
+	// advance for own-server-id events (the SQL thread skips them) — including the own domain
+	// would make MASTER_GTID_WAIT unsatisfiable and fence the promotion forever. Our own domain's
+	// writes are local by definition; the tail we must not lose lives in the other domains.
+	localDomainId, err := primaryClient.GtidDomainId(ctx)
+	if err != nil {
+		return false, fmt.Errorf("error getting gtid_domain_id: %v", err)
+	}
+	waitPos, err := filterOutDomain(outgoingPos, *localDomainId)
+	if err != nil {
+		return false, fmt.Errorf("error filtering outgoing gtid_binlog_pos %s: %v", outgoingPos, err)
+	}
+	if waitPos == "" {
+		return true, nil
+	}
+
+	err = primaryClient.WaitForReplicaGtid(ctx, waitPos, multiClusterCatchUpTimeout)
+	if errors.Is(err, sql.ErrWaitReplicaTimeout) {
+		logger.Info(
+			"Promotion fenced: not yet caught up with outgoing multi-cluster primary, requeuing...",
+			"member", outgoingPrimary, "gtid", waitPos,
+		)
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("error waiting for GTID %s from outgoing primary: %v", waitPos, err)
+	}
+	logger.Info(
+		"Caught up with outgoing multi-cluster primary, proceeding with promotion",
+		"member", outgoingPrimary, "gtid", waitPos,
+	)
+	return true, nil
+}
+
+// filterOutDomain drops the GTIDs of the given replication domain from a GTID position.
+func filterOutDomain(rawPos string, domainId uint32) (string, error) {
+	gtids, err := replication.ParseAllGtids(rawPos)
+	if err != nil {
+		return "", err
+	}
+	filtered := make([]replication.Gtid, 0, len(gtids))
+	for _, gtid := range gtids {
+		if gtid.DomainID != domainId {
+			filtered = append(filtered, gtid)
+		}
+	}
+	return replication.GtidsToString(filtered...), nil
+}
+
+func (r *MariaDBReconciler) getExternalMemberClient(ctx context.Context, mdb *mariadbv1alpha1.MariaDB,
+	member string) (*sql.Client, error) {
+	externalMariaDBRef, err := mdb.Spec.MultiCluster.GetExternalMariaDBRefForMember(member)
+	if err != nil {
+		return nil, fmt.Errorf("error finding externalMariaDBRef for member %s: %v", member, err)
+	}
+	externalMariaDB, err := r.RefResolver.ExternalMariaDB(ctx, externalMariaDBRef, mdb.Namespace)
+	if err != nil {
+		return nil, fmt.Errorf("error getting ExternalMariaDB for member %s: %v", member, err)
+	}
+	externalClient, err := sql.NewClientWithMariaDB(ctx, externalMariaDB, r.RefResolver)
+	if err != nil {
+		return nil, fmt.Errorf("error creating client for member %s: %v", member, err)
+	}
+	return externalClient, nil
 }
 
 func (r *MariaDBReconciler) shouldReconcileMultiCluster(ctx context.Context, mdb *mariadbv1alpha1.MariaDB,
