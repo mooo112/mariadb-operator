@@ -283,7 +283,9 @@ func requeueResult(ctx context.Context, mdb *mariadbv1alpha1.MariaDB) (ctrl.Resu
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	if mdb.IsReplicationEnabled() {
+	// Multi-cluster is included independently of replication: a Galera replica cluster also runs
+	// the 'multi-cluster' replication connection on its primary replica.
+	if mdb.IsReplicationEnabled() || mdb.IsMultiClusterEnabled() {
 		// Replication health (thread state, roles in status.replication) is only observed during
 		// reconciles, and a stopped or broken replication connection emits no Kubernetes event:
 		// without a periodic requeue it goes undetected — and unrepaired — until an unrelated

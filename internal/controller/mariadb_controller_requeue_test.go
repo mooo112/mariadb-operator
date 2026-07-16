@@ -38,6 +38,18 @@ func TestRequeueResult(t *testing.T) {
 			wantRequeue: 1 * time.Minute,
 		},
 		{
+			// a Galera replica cluster runs the 'multi-cluster' replication connection on its
+			// primary replica: its health needs the same periodic observation even though
+			// spec.replication is not enabled
+			name: "multi-cluster without replication requeues to observe health",
+			mdb: &mariadbv1alpha1.MariaDB{
+				Spec: mariadbv1alpha1.MariaDBSpec{
+					MultiCluster: &mariadbv1alpha1.MultiCluster{Enabled: true},
+				},
+			},
+			wantRequeue: 1 * time.Minute,
+		},
+		{
 			name: "replication takes precedence over TLS",
 			mdb: &mariadbv1alpha1.MariaDB{
 				Spec: mariadbv1alpha1.MariaDBSpec{
