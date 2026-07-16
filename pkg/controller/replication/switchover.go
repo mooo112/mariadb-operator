@@ -273,11 +273,7 @@ func (r *ReplicationReconciler) waitForNewPrimarySync(ctx context.Context, req *
 		if err != nil {
 			return fmt.Errorf("error getting new primary status: %v", err)
 		}
-		gtidDomainId, err := newPrimaryClient.GtidDomainId(ctx)
-		if err != nil {
-			return fmt.Errorf("error getting GTID domain ID in new primary: %v", err)
-		}
-		hasRelayLogEvents, err := HasRelayLogEvents(status, *gtidDomainId, logger)
+		hasRelayLogEvents, err := HasRelayLogEvents(status, logger)
 		if err != nil {
 			return fmt.Errorf("error checking relay logs: %v", err)
 		}

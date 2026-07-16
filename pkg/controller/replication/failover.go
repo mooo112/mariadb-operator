@@ -62,7 +62,7 @@ func (f *FailoverHandler) FurthestAdvancedReplica(ctx context.Context) (string, 
 
 type promotionCandidate struct {
 	name           string
-	gtidCurrentPos *replication.Gtid
+	gtidCurrentPos replication.GtidSet
 }
 
 func (f *FailoverHandler) findCandidates(ctx context.Context, pods []corev1.Pod) []promotionCandidate {
@@ -104,13 +104,7 @@ func (f *FailoverHandler) findCandidates(ctx context.Context, pods []corev1.Pod)
 			continue
 		}
 
-		gtidDomainId, err := sqlClient.GtidDomainId(ctx)
-		if err != nil {
-			podLogger.Info("Error getting GTID domain ID. Skipping...", "err", err)
-			continue
-		}
-
-		hasRelayLogEvents, err := HasRelayLogEvents(status, *gtidDomainId, podLogger)
+		hasRelayLogEvents, err := HasRelayLogEvents(status, podLogger)
 		if err != nil {
 			podLogger.Info("Error checking relay log events. Skipping...", "err", err)
 			continue
@@ -124,7 +118,11 @@ func (f *FailoverHandler) findCandidates(ctx context.Context, pods []corev1.Pod)
 			podLogger.Info("GTID current position not set. Skipping...")
 			continue
 		}
-		gtidCurrentPos, err := replication.ParseGtidWithDomainId(*status.GtidCurrentPos, *gtidDomainId, f.logger)
+		// Positions are compared across ALL domains: with multiple GTID domains (e.g.
+		// multi-cluster), progress lives in foreign domains, and a candidate whose position
+		// lacks the local domain (e.g. bootstrapped from another cluster's backup) is still
+		// a valid candidate.
+		gtidCurrentPos, err := replication.ParseGtidSet(*status.GtidCurrentPos)
 		if err != nil {
 			podLogger.Info("Error parsing GTID current position. Skipping...", "err", err)
 			continue
@@ -138,28 +136,29 @@ func (f *FailoverHandler) findCandidates(ctx context.Context, pods []corev1.Pod)
 	return candidates
 }
 
+// furthestAdvancedCandidate picks the candidate whose position is ahead of (or equal to)
+// every other candidate's, across all GTID domains. Domain-wise comparison is a partial
+// order: candidates ahead in different domains have diverged, which within a single cluster
+// should not happen (replicas apply a single stream). Divergence is logged loudly and
+// resolved deterministically by keeping the earlier candidate (candidates are sorted by
+// name) — promoting either side of a divergence loses the other side's writes regardless.
 func (f *FailoverHandler) furthestAdvancedCandidate(candidates []promotionCandidate) *promotionCandidate {
 	var furthestAdvanced *promotionCandidate
 	for i := range candidates {
 		c := &candidates[i]
-		candidateLogger := f.logger.WithValues("candidate", c.name)
 
-		if c.gtidCurrentPos == nil {
-			candidateLogger.Info("GTID position not set. Skipping...")
-			continue
-		}
 		if furthestAdvanced == nil {
 			furthestAdvanced = c
 			continue
 		}
-
-		greaterThan, err := c.gtidCurrentPos.GreaterThan(furthestAdvanced.gtidCurrentPos)
-		if err != nil {
-			candidateLogger.Info("Error comparing GTID values. Skipping...", "err", err)
-			continue
-		}
-		if greaterThan {
+		if c.gtidCurrentPos.AheadOrEqual(furthestAdvanced.gtidCurrentPos) {
 			furthestAdvanced = c
+		} else if !furthestAdvanced.gtidCurrentPos.AheadOrEqual(c.gtidCurrentPos) {
+			f.logger.Info(
+				"GTID positions of promotion candidates have diverged, keeping the first candidate",
+				"candidate", furthestAdvanced.name, "candidate-gtid", furthestAdvanced.gtidCurrentPos.String(),
+				"diverged", c.name, "diverged-gtid", c.gtidCurrentPos.String(),
+			)
 		}
 	}
 	return furthestAdvanced

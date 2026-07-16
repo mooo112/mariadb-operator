@@ -9,9 +9,11 @@ import (
 	"github.com/mariadb-operator/mariadb-operator/v26/pkg/replication"
 )
 
-// HasRelayLogEvents indicates that there are events in the IO thread to be applied by the SQL thread.
-func HasRelayLogEvents(status *mariadbv1alpha1.ReplicaStatusVars, gtidDomainId uint32,
-	logger logr.Logger) (bool, error) {
+// HasRelayLogEvents indicates that there are events in the IO thread to be applied by the SQL
+// thread. Every domain present in the IO position is checked: with multiple GTID domains
+// (e.g. multi-cluster), pending events live in foreign domains that a local-domain-only
+// comparison would miss, reporting a replica as drained while it still has a relay backlog.
+func HasRelayLogEvents(status *mariadbv1alpha1.ReplicaStatusVars, logger logr.Logger) (bool, error) {
 	if status.GtidIOPos == nil {
 		return false, errors.New("GTID IO position must be set")
 	}
@@ -19,23 +21,16 @@ func HasRelayLogEvents(status *mariadbv1alpha1.ReplicaStatusVars, gtidDomainId u
 		return false, errors.New("GTID SQL position must be set")
 	}
 
-	gtidIOPos, err := replication.ParseGtidWithDomainId(*status.GtidIOPos, gtidDomainId, logger)
+	gtidIOPos, err := replication.ParseGtidSet(*status.GtidIOPos)
 	if err != nil {
 		return false, fmt.Errorf("error parsing GTID IO position: %v", err)
 	}
-	gtidCurrentPos, err := replication.ParseGtidWithDomainId(*status.GtidCurrentPos, gtidDomainId, logger)
+	gtidCurrentPos, err := replication.ParseGtidSet(*status.GtidCurrentPos)
 	if err != nil {
 		return false, fmt.Errorf("error parsing GTID SQL position: %v", err)
 	}
 
-	if gtidIOPos.Equal(gtidCurrentPos) {
-		return false, nil
-	}
-	greaterThan, err := gtidIOPos.GreaterThan(gtidCurrentPos)
-	if err != nil {
-		return false, fmt.Errorf("error comparing GTID IO and SQL positions: %v", err)
-	}
-	if greaterThan {
+	if !gtidCurrentPos.AheadOrEqual(gtidIOPos) {
 		logger.Info(
 			"Detected events in relay log. Skipping...",
 			"gtid-io-pos", gtidIOPos.String(),
@@ -43,11 +38,5 @@ func HasRelayLogEvents(status *mariadbv1alpha1.ReplicaStatusVars, gtidDomainId u
 		)
 		return true, nil
 	}
-
-	logger.Info(
-		"GTID SQL position ahead of IO (unexpected state)",
-		"gtid-io-pos", gtidIOPos.String(),
-		"gtid-current-pos", gtidCurrentPos.String(),
-	)
 	return false, nil
 }
