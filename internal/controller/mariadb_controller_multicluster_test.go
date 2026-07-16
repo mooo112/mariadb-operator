@@ -10,6 +10,7 @@ import (
 	. "github.com/onsi/gomega"
 	. "github.com/onsi/gomega/gstruct"
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -1096,6 +1097,14 @@ func testMultiClusterSwitchoverBuilder(primaryGtidDomainId, replicaGtidDomainId 
 				})))
 			return true
 		}, testTimeout, testInterval).Should(BeTrue())
+
+		By("Expecting cluster switchover condition to be true on both clusters")
+		expectMariadbFn(testCtx, k8sClient, replicaKey, func(mdb *mariadbv1alpha1.MariaDB) bool {
+			return apimeta.IsStatusConditionTrue(mdb.Status.Conditions, mariadbv1alpha1.ConditionTypeMultiClusterPrimarySwitched)
+		})
+		expectMariadbFn(testCtx, k8sClient, primaryKey, func(mdb *mariadbv1alpha1.MariaDB) bool {
+			return apimeta.IsStatusConditionTrue(mdb.Status.Conditions, mariadbv1alpha1.ConditionTypeMultiClusterPrimarySwitched)
+		})
 
 		// runbook step 5: lift maintenance mode once the switchover completed
 		By("Disabling maintenance mode on demoted cluster")

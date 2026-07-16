@@ -3,6 +3,7 @@ package v1alpha1
 import (
 	"fmt"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/utils/ptr"
 )
 
@@ -56,22 +57,51 @@ func (m *MariaDB) IsMultiClusterEnabled() bool {
 	return ptr.Deref(m.Spec.MultiCluster, MultiCluster{}).Enabled
 }
 
-// IsMultiClusterPrimary indicates whether the current cluster is a primary cluster part of a multi-cluster topology.
+// currentMultiClusterPrimary is the cluster member currently acting as the multi-cluster
+// primary. Roles are gated on status.currentMultiClusterPrimary, which the multi-cluster
+// reconciliation phase only advances after fencing, connection teardown and GTID
+// reconfiguration: deriving roles from the spec directly would make a promoted cluster
+// writable while it is still applying the outgoing primary's stream, and start a demoted
+// cluster's replication before its GTID position is set (dual-writer window).
+// During provisioning, before the status is first populated, the spec is the only source.
+func (m *MariaDB) currentMultiClusterPrimary() string {
+	if current := ptr.Deref(m.Status.CurrentMultiClusterPrimary, ""); current != "" {
+		return current
+	}
+	return ptr.Deref(m.Spec.MultiCluster, MultiCluster{}).Primary
+}
+
+// IsMultiClusterPrimary indicates whether the current cluster acts as a primary cluster in a
+// multi-cluster topology. See currentMultiClusterPrimary for the status-gating rationale; the
+// spec's designation is available via IsMultiClusterDesiredPrimary.
 func (m *MariaDB) IsMultiClusterPrimary() bool {
+	return m.IsMultiClusterEnabled() && m.currentMultiClusterPrimary() == m.Name
+}
+
+// IsMultiClusterDesiredPrimary indicates whether the spec designates the current cluster as
+// the primary cluster of a multi-cluster topology. It differs from IsMultiClusterPrimary
+// while a cluster-level switchover is pending or in progress.
+func (m *MariaDB) IsMultiClusterDesiredPrimary() bool {
 	return m.IsMultiClusterEnabled() && ptr.Deref(m.Spec.MultiCluster, MultiCluster{}).Primary == m.Name
 }
 
-// GetMultiClusterPrimary obtains the primary cluster member name.
+// GetMultiClusterPrimary obtains the member name of the cluster currently acting as primary.
 func (m *MariaDB) GetMultiClusterPrimary() *string {
 	if !m.IsMultiClusterEnabled() {
 		return nil
 	}
-	return ptr.To(ptr.Deref(m.Spec.MultiCluster, MultiCluster{}).Primary)
+	return ptr.To(m.currentMultiClusterPrimary())
 }
 
-// IsMultiClusterReplica indicates whether the current cluster is a replica cluster part of a multi-cluster topology.
+// IsMultiClusterReplica indicates whether the current cluster acts as a replica cluster in a
+// multi-cluster topology. See currentMultiClusterPrimary for the status-gating rationale.
 func (m *MariaDB) IsMultiClusterReplica() bool {
-	return m.IsMultiClusterEnabled() && ptr.Deref(m.Spec.MultiCluster, MultiCluster{}).Primary != m.Name
+	return m.IsMultiClusterEnabled() && m.currentMultiClusterPrimary() != m.Name
+}
+
+// IsSwitchingMultiClusterPrimary indicates whether a cluster-level switchover is in progress.
+func (m *MariaDB) IsSwitchingMultiClusterPrimary() bool {
+	return meta.IsStatusConditionFalse(m.Status.Conditions, ConditionTypeMultiClusterPrimarySwitched)
 }
 
 // IsMultiClusterPrimaryReplica determines whether a given Pod index is a primary Pod in a replica cluster.

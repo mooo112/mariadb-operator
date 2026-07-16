@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-logr/logr"
 	mariadbv1alpha1 "github.com/mariadb-operator/mariadb-operator/v26/api/v1alpha1"
+	condition "github.com/mariadb-operator/mariadb-operator/v26/pkg/condition"
 	replicationctrl "github.com/mariadb-operator/mariadb-operator/v26/pkg/controller/replication"
 	"github.com/mariadb-operator/mariadb-operator/v26/pkg/metadata"
 	"github.com/mariadb-operator/mariadb-operator/v26/pkg/replication"
@@ -44,6 +45,7 @@ func (r *MariaDBReconciler) reconcileMultiCluster(ctx context.Context, mdb *mari
 	if currentPrimary == "" {
 		return ctrl.Result{}, r.patchStatus(ctx, mdb, func(status *mariadbv1alpha1.MariaDBStatus) error {
 			status.CurrentMultiClusterPrimary = &primary
+			condition.SetMultiClusterPrimarySwitched(status)
 			return nil
 		})
 	}
@@ -53,7 +55,21 @@ func (r *MariaDBReconciler) reconcileMultiCluster(ctx context.Context, mdb *mari
 		return ctrl.Result{}, r.clearForcePromote(ctx, mdb, logger)
 	}
 
-	if mdb.IsMultiClusterPrimary() {
+	// mark the switchover in progress so it is distinguishable from a converged (or stuck)
+	// state; roles keep following status.currentMultiClusterPrimary until it completes
+	if !mdb.IsSwitchingMultiClusterPrimary() {
+		if err := r.patchStatus(ctx, mdb, func(status *mariadbv1alpha1.MariaDBStatus) error {
+			condition.SetMultiClusterPrimarySwitching(status, primary)
+			return nil
+		}); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// promote/demote is decided by the spec (the desired role); every other role consumer is
+	// gated on status.currentMultiClusterPrimary so that the promoted cluster only becomes
+	// writable — and the demoted cluster only starts replicating — after the steps below
+	if mdb.IsMultiClusterDesiredPrimary() {
 		forced := isPromotionForced(mdb)
 		if forced {
 			r.Recorder.Eventf(mdb, nil, corev1.EventTypeWarning, mariadbv1alpha1.ReasonMultiClusterPromotionForced,
@@ -81,6 +97,7 @@ func (r *MariaDBReconciler) reconcileMultiCluster(ctx context.Context, mdb *mari
 
 	if err := r.patchStatus(ctx, mdb, func(status *mariadbv1alpha1.MariaDBStatus) error {
 		status.CurrentMultiClusterPrimary = &primary
+		condition.SetMultiClusterPrimarySwitched(status)
 		return nil
 	}); err != nil {
 		return ctrl.Result{}, err
@@ -157,7 +174,18 @@ func (r *MariaDBReconciler) reconfigureReplicaClusterGtids(ctx context.Context, 
 	}
 	defer primaryClient.Close()
 
-	if err := primaryClient.StopSlave(ctx, sql.WithConnectionName(replicationctrl.MultiClusterReplicaConnectionName)); err != nil {
+	// Stop taking writes before snapshotting the position: gtid_current_pos of a still-writable
+	// primary is a moving target, and the promoting cluster's fence waits for this cluster to
+	// report read_only=1 before trusting its gtid_binlog_pos.
+	if err := primaryClient.EnableReadOnly(ctx); err != nil {
+		return fmt.Errorf("error enabling read_only in primary: %v", err)
+	}
+	// The 'multi-cluster' connection does not exist yet on a demoting primary: it is created by
+	// the Replication phase once the demotion completes and the role follows the patched status.
+	if err := primaryClient.StopSlave(
+		ctx,
+		sql.WithConnectionName(replicationctrl.MultiClusterReplicaConnectionName),
+	); err != nil && !sql.IsConnectionNotExists(err) {
 		return fmt.Errorf("error stopping primary replica: %v", err)
 	}
 	currentPos, err := primaryClient.GtidCurrentPos(ctx)
@@ -171,7 +199,10 @@ func (r *MariaDBReconciler) reconfigureReplicaClusterGtids(ctx context.Context, 
 			return fmt.Errorf("error setting gtid_slave_pos %s in primary replica: %v", currentPos, err)
 		}
 	}
-	if err := primaryClient.StartSlave(ctx, sql.WithConnectionName(replicationctrl.MultiClusterReplicaConnectionName)); err != nil {
+	if err := primaryClient.StartSlave(
+		ctx,
+		sql.WithConnectionName(replicationctrl.MultiClusterReplicaConnectionName),
+	); err != nil && !sql.IsConnectionNotExists(err) {
 		return fmt.Errorf("error starting primary replica: %v", err)
 	}
 	return nil

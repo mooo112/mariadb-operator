@@ -573,6 +573,14 @@ kubectl annotate mariadb <new-primary> k8s.mariadb.com/force-promote=true
 
 The annotation skips the catch-up fence for a single promotion and is removed automatically once it completes; writes not yet replicated from the outgoing primary are lost on the promoted cluster (a `MultiClusterPromotionForced` warning event records this). When the outgoing cluster returns, its un-replicated writes surface as replication error 1236 (see below).
 
+Cluster roles follow `status.currentMultiClusterPrimary`, not the spec directly: after patching `spec.multiCluster.primary`, a cluster keeps acting in its previous role until the switchover reconciliation completes. A promoted cluster only becomes writable after the fence passed and its replication connection was torn down; a demoted cluster sets `read_only=1` and positions `gtid_slave_pos` before it starts replicating from the new primary. The `MultiClusterPrimarySwitched` status condition reports the transition (`False` while a cluster-level switchover is in progress, `True` once complete):
+
+```bash
+kubectl wait --for=condition=MultiClusterPrimarySwitched mariadb <name>
+```
+
+Because the demoting cluster fences itself (it turns read-only before its position is trusted), patching both CRs — in any order — converges safely: the promoted side stays fenced until the demoted side stopped taking writes and it has caught up. Maintenance mode on the outgoing primary remains recommended to drain client connections, but is no longer what prevents write loss.
+
 Clusters keep their full multi-domain GTID state across switchovers, and a re-homing cluster resumes replication from its own `gtid_current_pos`. Writes that never replicated before an unplanned failover therefore surface as replication error 1236 on the returning cluster's `multi-cluster` connection — a deliberate, loud signal of divergence. Recover by re-provisioning the diverged cluster from the new primary (e.g. via `bootstrapFrom`), after salvaging any needed rows from its binlog.
 
 The switchover process consists of the following steps:
