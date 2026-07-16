@@ -116,8 +116,12 @@ func (r *MariaDBReconciler) reconcilePITR(ctx context.Context, mdb *mariadbv1alp
 	return ctrl.Result{}, nil
 }
 
+// getStartGtid obtains the full, multi-domain GTID position to start the binlog replay from.
+// Every domain must be kept: mariadb-binlog's --start-position only filters events of the
+// domains it is given — a position reduced to a single domain would replay the other domains'
+// events from the beginning of the timeline, re-applying them onto restored data.
 func (r *MariaDBReconciler) getStartGtid(ctx context.Context, mdb *mariadbv1alpha1.MariaDB,
-	logger logr.Logger) (*replication.Gtid, error) {
+	logger logr.Logger) (replication.GtidSet, error) {
 	var rawGtid string
 
 	if mdb.Spec.BootstrapFrom != nil && mdb.Spec.BootstrapFrom.VolumeSnapshotRef != nil {
@@ -157,19 +161,12 @@ func (r *MariaDBReconciler) getStartGtid(ctx context.Context, mdb *mariadbv1alph
 		return nil, errors.New("GTID not found")
 	}
 
-	client, err := sql.NewClientWithMariaDB(ctx, mdb, r.RefResolver)
-	if err != nil {
-		return nil, fmt.Errorf("error getting SQL client: %v", err)
-	}
-	defer client.Close()
-
-	domainId, err := client.GtidDomainId(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("error getting gtid_domain_id: %v", err)
-	}
-	gtid, err := replication.ParseGtidWithDomainId(rawGtid, *domainId, logger.WithName("gtid"))
+	gtid, err := replication.ParseGtidSet(rawGtid)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing GTID %s: %v", rawGtid, err)
+	}
+	if len(gtid) == 0 {
+		return nil, errors.New("GTID not found")
 	}
 	return gtid, nil
 }
@@ -217,7 +214,7 @@ func (r *MariaDBReconciler) reconcileReplayBinlogsError(ctx context.Context, mar
 	return ctrl.Result{}, nil
 }
 
-func (r *MariaDBReconciler) validateBinlogTimeline(ctx context.Context, mdb *mariadbv1alpha1.MariaDB, startGtid *replication.Gtid,
+func (r *MariaDBReconciler) validateBinlogTimeline(ctx context.Context, mdb *mariadbv1alpha1.MariaDB, startGtid replication.GtidSet,
 	strictMode bool, storageClient interfaces.BlobStorage, logger logr.Logger) error {
 	indexReader, err := storageClient.GetObjectWithOptions(ctx, binlog.BinlogIndexName)
 	if err != nil {
@@ -297,7 +294,7 @@ func (r *MariaDBReconciler) reconcileAndWaitForPITRJob(ctx context.Context, mdb 
 	return ctrl.Result{}, nil
 }
 
-func (r *MariaDBReconciler) createPITRJob(ctx context.Context, mdb *mariadbv1alpha1.MariaDB, startGtid *replication.Gtid) error {
+func (r *MariaDBReconciler) createPITRJob(ctx context.Context, mdb *mariadbv1alpha1.MariaDB, startGtid replication.GtidSet) error {
 	pitr, err := r.RefResolver.PointInTimeRecovery(ctx, mdb.Spec.BootstrapFrom.PointInTimeRecoveryRef, mdb.Namespace)
 	if err != nil {
 		return fmt.Errorf("error getting PointInTimeRecovery: %v", err)

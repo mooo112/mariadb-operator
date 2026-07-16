@@ -455,7 +455,7 @@ func (b *Builder) BuildRestoreJob(key types.NamespacedName, restore *mariadbv1al
 }
 
 type RestoreOpts struct {
-	StartGtid          *replication.Gtid
+	StartGtid          replication.GtidSet
 	TargetRecoveryTime *time.Time
 	Volume             *mariadbv1alpha1.StorageVolumeSource
 	S3                 *mariadbv1alpha1.S3
@@ -470,7 +470,7 @@ type RestoreOpts struct {
 
 type RestoreOpt func(*RestoreOpts) error
 
-func WithStartGtid(gtid *replication.Gtid) RestoreOpt {
+func WithStartGtid(gtid replication.GtidSet) RestoreOpt {
 	return func(opts *RestoreOpts) error {
 		opts.StartGtid = gtid
 		return nil
@@ -671,7 +671,7 @@ func (b *Builder) BuildPITRJob(key types.NamespacedName, pitr *mariadbv1alpha1.P
 			return nil, fmt.Errorf("error setting restore option: %v", err)
 		}
 	}
-	if opts.StartGtid == nil {
+	if len(opts.StartGtid) == 0 {
 		return nil, errors.New("startGtid option must be set")
 	}
 	if opts.TargetRecoveryTime == nil {

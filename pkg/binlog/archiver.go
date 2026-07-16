@@ -473,7 +473,7 @@ func (a *Archiver) updateStatus(ctx context.Context, binlogs []string, storageCl
 	if err != nil {
 		return fmt.Errorf("error updating binlog index: %v", err)
 	}
-	lastRecoverableTime, err := a.getLastRecoverableTime(binlogIndex, backup, *gtidDomainId)
+	lastRecoverableTime, err := a.getLastRecoverableTime(binlogIndex, backup)
 	if err != nil {
 		return fmt.Errorf("error getting last recoverable time: %v", err)
 	}
@@ -593,8 +593,8 @@ func (a *Archiver) updateBinlogIndex(ctx context.Context, binlogs []string, serv
 	return index, nil
 }
 
-func (a *Archiver) getLastRecoverableTime(binlogIndex *BinlogIndex, backup *mariadbv1alpha1.PhysicalBackup,
-	gtidDomainId uint32) (*metav1.Time, error) {
+func (a *Archiver) getLastRecoverableTime(binlogIndex *BinlogIndex,
+	backup *mariadbv1alpha1.PhysicalBackup) (*metav1.Time, error) {
 	lastGtid, ok := backup.Annotations[metadata.LastGtidAnnotation]
 	if !ok {
 		a.logger.Info(
@@ -603,7 +603,7 @@ func (a *Archiver) getLastRecoverableTime(binlogIndex *BinlogIndex, backup *mari
 		)
 		return nil, nil
 	}
-	gtid, err := replication.ParseGtidWithDomainId(lastGtid, gtidDomainId, a.logger)
+	gtid, err := replication.ParseGtidSet(lastGtid)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing GTID: %v", err)
 	}

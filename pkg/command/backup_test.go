@@ -1479,8 +1479,8 @@ func TestPhysicalBackupArgs(t *testing.T) {
 	}
 }
 
-func mustParseGtid(t *testing.T, rawGtid string) *replication.Gtid {
-	gtid, err := replication.ParseGtid(rawGtid)
+func mustParseGtid(t *testing.T, rawGtid string) replication.GtidSet {
+	gtid, err := replication.ParseGtidSet(rawGtid)
 	if err != nil {
 		t.Fatalf("unexpected error parsing GTID: %v", err)
 	}

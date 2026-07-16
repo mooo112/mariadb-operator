@@ -318,8 +318,10 @@ func handleBackupMeta(ctx context.Context, backupLogger logr.Logger) error {
 	if err != nil {
 		return fmt.Errorf("error getting backup GTID: %v", err)
 	}
-	// TODO: support multiple GTID domain IDs
-	gtid, err := replication.ParseGtid(rawGTID)
+	// The full multi-domain position is kept: on servers that replicated foreign domains
+	// (e.g. multi-cluster), mariadb_backup_binlog_info contains one GTID per domain, and
+	// reducing it would break the binlog replay start position derived from this annotation.
+	gtid, err := replication.ParseGtidSet(rawGTID)
 	if err != nil {
 		return fmt.Errorf("error parsing GTID %s: %v", rawGTID, err)
 	}

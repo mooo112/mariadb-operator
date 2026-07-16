@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -50,14 +51,38 @@ func (b *BinlogIndex) Add(serverId uint32, meta BinlogMetadata) {
 	b.Binlogs[serverKey(serverId)] = append(b.Binlogs[serverKey(serverId)], meta)
 }
 
-func (b *BinlogIndex) BuildTimeline(starGtid *mariadbrepl.Gtid, targetTime time.Time, strictMode bool,
+func (b *BinlogIndex) BuildTimeline(startGtid mariadbrepl.GtidSet, targetTime time.Time, strictMode bool,
 	logger logr.Logger) ([]BinlogMetadata, error) {
-	return b.buildTimelineWithBinlogs(nil, starGtid, targetTime, strictMode, logger)
+	currentServerKey, err := b.startServerKey(startGtid)
+	if err != nil {
+		return nil, err
+	}
+	return b.buildTimelineWithBinlogs(nil, currentServerKey, startGtid, targetTime, strictMode, logger)
 }
 
-func (b *BinlogIndex) buildTimelineWithBinlogs(binlogs []BinlogMetadata, startGtid *mariadbrepl.Gtid, targetTime time.Time,
-	strictMode bool, binlogLogger logr.Logger) ([]BinlogMetadata, error) {
-	currentServerKey := serverKey(startGtid.ServerID)
+// startServerKey selects the server bucket to start the timeline from. A GTID position
+// references one server per domain: the bucket of any of them continues the position (relayed
+// foreign-domain servers are not archived here, so typically exactly one bucket exists).
+// Domains are tried in ascending order for determinism.
+func (b *BinlogIndex) startServerKey(startGtid mariadbrepl.GtidSet) (string, error) {
+	domains := make([]uint32, 0, len(startGtid))
+	for domain := range startGtid {
+		domains = append(domains, domain)
+	}
+	sort.Slice(domains, func(i, j int) bool { return domains[i] < domains[j] })
+
+	for _, domain := range domains {
+		gtid := startGtid[domain]
+		key := serverKey(gtid.ServerID)
+		if _, ok := b.Binlogs[key]; ok {
+			return key, nil
+		}
+	}
+	return "", fmt.Errorf("binlogs for servers in start position %q not found: %w", startGtid.String(), ErrNoBinlogs)
+}
+
+func (b *BinlogIndex) buildTimelineWithBinlogs(binlogs []BinlogMetadata, currentServerKey string, startGtid mariadbrepl.GtidSet,
+	targetTime time.Time, strictMode bool, binlogLogger logr.Logger) ([]BinlogMetadata, error) {
 	logger := binlogLogger.WithValues(
 		"num-binlogs", len(binlogs),
 		"start-gtid", startGtid.String(),
@@ -106,18 +131,18 @@ func (b *BinlogIndex) buildTimelineWithBinlogs(binlogs []BinlogMetadata, startGt
 				logger.Info(
 					"GTID gap detected. Attempting to find next GTID in another server...",
 					"processed-binlog", lastBinlog.BinlogFilename,
-					"processed-gtid", lastBinlog.LastGtid.String(),
+					"processed-gtid", lastBinlog.LastGtidSet().String(),
 					"binlog", binlog.BinlogFilename,
-					"gtid", binlog.FirstGtid.String(),
+					"gtid", binlog.FirstGtidSet().String(),
 				)
-				nextGtid, err := b.findNextGtidInOtherServer(&lastBinlog, currentServerKey, targetTime, logger.WithName("gtid-gap"))
+				nextServerKey, err := b.findNextServer(&lastBinlog, currentServerKey, targetTime, logger.WithName("gtid-gap"))
 				if err != nil {
-					return nil, fmt.Errorf("unable to find next GTID: %v", err)
+					return nil, fmt.Errorf("unable to find next server: %v", err)
 				}
-				if nextGtid == nil {
+				if nextServerKey == "" {
 					break // stop processing binlogs when a gap is detected
 				}
-				return b.buildTimelineWithBinlogs(binlogs, nextGtid, targetTime, strictMode, logger)
+				return b.buildTimelineWithBinlogs(binlogs, nextServerKey, lastBinlog.LastGtidSet(), targetTime, strictMode, logger)
 			}
 		}
 
@@ -154,27 +179,36 @@ func (b *BinlogIndex) buildTimelineWithBinlogs(binlogs []BinlogMetadata, startGt
 	return binlogs, nil
 }
 
-func (b *BinlogIndex) findNextGtidInOtherServer(lastBinlog *BinlogMetadata, currentServer string, untilTime time.Time,
-	logger logr.Logger) (*mariadbrepl.Gtid, error) {
+// findNextServer looks for a server bucket, other than the current one, containing a binlog
+// that continues the last processed binlog without a GTID gap. Buckets are iterated in sorted
+// order for determinism. An empty key is returned when no continuation exists.
+func (b *BinlogIndex) findNextServer(lastBinlog *BinlogMetadata, currentServer string, untilTime time.Time,
+	logger logr.Logger) (string, error) {
 	if lastBinlog == nil {
-		return nil, errors.New("last processed binlog must be set")
+		return "", errors.New("last processed binlog must be set")
 	}
 	if lastBinlog.LastGtid == nil {
 		logger.Info("Last processed binlog must have last GTID set. Skipping...", "binlog", lastBinlog.BinlogFilename)
-		return nil, nil
+		return "", nil
 	}
 	if !lastBinlog.StopEvent {
 		logger.Info("Last processed binlog must have a stop event. Skipping...", "binlog", lastBinlog.BinlogFilename)
-		return nil, nil
+		return "", nil
 	}
-	for serverKey, binlogs := range b.Binlogs {
+	serverKeys := make([]string, 0, len(b.Binlogs))
+	for key := range b.Binlogs {
+		serverKeys = append(serverKeys, key)
+	}
+	sort.Strings(serverKeys)
+
+	for _, serverKey := range serverKeys {
 		if serverKey == currentServer {
 			continue
 		}
-		for _, binlog := range binlogs {
-			shouldFilter, err := shouldFilterBinlog(&binlog, lastBinlog.LastGtid, untilTime, logger)
+		for _, binlog := range b.Binlogs[serverKey] {
+			shouldFilter, err := shouldFilterBinlog(&binlog, lastBinlog.LastGtidSet(), untilTime, logger)
 			if err != nil {
-				return nil, fmt.Errorf("error determining whether binlog %s should be filtered: %v", binlog.BinlogFilename, err)
+				return "", fmt.Errorf("error determining whether binlog %s should be filtered: %v", binlog.BinlogFilename, err)
 			}
 			if shouldFilter {
 				continue
@@ -182,21 +216,21 @@ func (b *BinlogIndex) findNextGtidInOtherServer(lastBinlog *BinlogMetadata, curr
 
 			gtidGap, err := hasGtidGap(lastBinlog, &binlog)
 			if err != nil {
-				return nil, fmt.Errorf("error determining GTID gap: %v", err)
+				return "", fmt.Errorf("error determining GTID gap: %v", err)
 			}
 			if !gtidGap {
-				return binlog.FirstGtid, nil
+				return serverKey, nil
 			}
 		}
 	}
-	return nil, nil
+	return "", nil
 }
 
 func serverKey(serverId uint32) string {
 	return fmt.Sprintf("server-%d", serverId)
 }
 
-func shouldFilterBinlog(binlog *BinlogMetadata, fromGtid *mariadbrepl.Gtid, untilTime time.Time, binlogLogger logr.Logger) (bool, error) {
+func shouldFilterBinlog(binlog *BinlogMetadata, fromGtid mariadbrepl.GtidSet, untilTime time.Time, binlogLogger logr.Logger) (bool, error) {
 	logger := binlogLogger.WithValues(
 		"binlog", binlog.BinlogFilename,
 		"time", binlog.FirstTime.Format(time.RFC3339),
@@ -211,14 +245,12 @@ func shouldFilterBinlog(binlog *BinlogMetadata, fromGtid *mariadbrepl.Gtid, unti
 		return true, nil
 	}
 	logger = logger.WithValues(
-		"gtid", binlog.LastGtid.String(),
+		"gtid", binlog.LastGtidSet().String(),
 	)
 
-	lessThanFromGtid, err := binlog.LastGtid.LessThan(fromGtid)
-	if err != nil {
-		return false, fmt.Errorf("error comparing GTIDs %s and %s: %v", binlog.LastGtid, fromGtid, err)
-	}
-	if lessThanFromGtid {
+	// the binlog is skippable when the start position already covers its newest event in
+	// every domain: replay would contribute nothing
+	if fromGtid.AheadOrEqual(binlog.LastGtidSet()) {
 		logger.Info("Skipping binlog, as it has older GTID events")
 		return true, nil
 	}
@@ -230,6 +262,10 @@ func shouldFilterBinlog(binlog *BinlogMetadata, fromGtid *mariadbrepl.Gtid, unti
 	return false, nil
 }
 
+// hasGtidGap detects missing events between two consecutive binlogs: within a domain,
+// sequence numbers of consecutive events differ by 1, so a larger step means a lost binlog.
+// Domains only present in the next binlog carry no continuity evidence (a domain can
+// legitimately be absent from a binlog) and are not treated as gaps.
 func hasGtidGap(lastBinlog, nextBinlog *BinlogMetadata) (bool, error) {
 	if lastBinlog == nil || lastBinlog.LastGtid == nil {
 		return false, errors.New("last processed binlog must have last GTID set")
@@ -237,16 +273,17 @@ func hasGtidGap(lastBinlog, nextBinlog *BinlogMetadata) (bool, error) {
 	if nextBinlog == nil || nextBinlog.FirstGtid == nil {
 		return false, errors.New("next binlog must have first GTID set")
 	}
-	diff, err := lastBinlog.LastGtid.Diff(nextBinlog.FirstGtid)
-	if err != nil {
-		return false, fmt.Errorf(
-			"error getting diff between GTIDs %v and %v: %v",
-			lastBinlog.LastGtid,
-			nextBinlog.FirstGtid,
-			err,
-		)
+	lastGtids := lastBinlog.LastGtidSet()
+	for domain, nextGtid := range nextBinlog.FirstGtidSet() {
+		lastGtid, ok := lastGtids[domain]
+		if !ok {
+			continue
+		}
+		if nextGtid.SequenceID > lastGtid.SequenceID+1 {
+			return true, nil
+		}
 	}
-	return diff > 1, nil
+	return false, nil
 }
 
 type BinlogNum struct {
@@ -289,8 +326,38 @@ type BinlogMetadata struct {
 	PreviousGtids  []*mariadbrepl.Gtid `json:"previousGtids,omitempty"`
 	FirstGtid      *mariadbrepl.Gtid   `json:"firstGtid,omitempty"`
 	LastGtid       *mariadbrepl.Gtid   `json:"lastGtid,omitempty"`
-	RotateEvent    bool                `json:"rotateEvent"`
-	StopEvent      bool                `json:"stopEvent"`
+	// FirstGtids and LastGtids track the first and last GTID event per replication domain:
+	// with multiple domains (e.g. multi-cluster with log_slave_updates) events of several
+	// domains interleave within a binlog, and the overall first/last event alone cannot
+	// answer ordering or continuity questions for the other domains.
+	FirstGtids  []*mariadbrepl.Gtid `json:"firstGtids,omitempty"`
+	LastGtids   []*mariadbrepl.Gtid `json:"lastGtids,omitempty"`
+	RotateEvent bool                `json:"rotateEvent"`
+	StopEvent   bool                `json:"stopEvent"`
+}
+
+// FirstGtidSet returns the first GTID per domain. Indexes written before multi-domain
+// support only carry the overall first/last GTID event: fall back to a single-domain set.
+func (b *BinlogMetadata) FirstGtidSet() mariadbrepl.GtidSet {
+	return gtidSetOf(b.FirstGtids, b.FirstGtid)
+}
+
+// LastGtidSet returns the last GTID per domain, falling back like FirstGtidSet.
+func (b *BinlogMetadata) LastGtidSet() mariadbrepl.GtidSet {
+	return gtidSetOf(b.LastGtids, b.LastGtid)
+}
+
+func gtidSetOf(gtids []*mariadbrepl.Gtid, fallback *mariadbrepl.Gtid) mariadbrepl.GtidSet {
+	set := make(mariadbrepl.GtidSet, len(gtids))
+	for _, gtid := range gtids {
+		if gtid != nil {
+			set[gtid.DomainID] = *gtid
+		}
+	}
+	if len(set) == 0 && fallback != nil {
+		set[fallback.DomainID] = *fallback
+	}
+	return set
 }
 
 func (b *BinlogMetadata) ObjectStoragePath() string {
@@ -309,12 +376,17 @@ func GetBinlogMetadata(binlogPath string, logger logr.Logger) (*BinlogMetadata, 
 	var (
 		rawFormatDescriptionEvent []byte
 		rawGtidListEvent          []byte
-		firstRawGtidEvent         []byte
-		lastRawGtidEvent          []byte
+		firstGtidByDomain         = make(map[uint32]*mariadbrepl.Gtid)
+		lastGtidByDomain          = make(map[uint32]*mariadbrepl.Gtid)
 	)
 
 	if err := parser.ParseFile(binlogPath, 0, func(e *replication.BinlogEvent) error {
-		meta.ServerId = e.Header.ServerID
+		// The first event (format description) is written by the server owning the binlog.
+		// Later events carry the ORIGINATING server's ID: with log_slave_updates, relayed
+		// events from other servers would otherwise make the metadata's server flap.
+		if meta.ServerId == 0 {
+			meta.ServerId = e.Header.ServerID
+		}
 		meta.LogPosition = e.Header.LogPos
 
 		// See: https://mariadb.com/docs/server/reference/clientserver-protocol/replication-protocol
@@ -324,10 +396,22 @@ func GetBinlogMetadata(binlogPath string, logger logr.Logger) (*BinlogMetadata, 
 		case replication.MARIADB_GTID_LIST_EVENT:
 			rawGtidListEvent = e.RawData
 		case replication.MARIADB_GTID_EVENT:
-			if firstRawGtidEvent == nil {
-				firstRawGtidEvent = e.RawData
+			gtidEvent, err := decodeGTIDEvent(e.RawData, e.Header.ServerID)
+			if err != nil {
+				return fmt.Errorf("error decoding GTID event: %v", err)
 			}
-			lastRawGtidEvent = e.RawData
+			gtid, err := toMariadbGtid(&gtidEvent.GTID)
+			if err != nil {
+				return err
+			}
+			if meta.FirstGtid == nil {
+				meta.FirstGtid = gtid
+			}
+			meta.LastGtid = gtid
+			if _, ok := firstGtidByDomain[gtid.DomainID]; !ok {
+				firstGtidByDomain[gtid.DomainID] = gtid
+			}
+			lastGtidByDomain[gtid.DomainID] = gtid
 		case replication.ROTATE_EVENT:
 			meta.RotateEvent = true
 		case replication.STOP_EVENT:
@@ -342,6 +426,8 @@ func GetBinlogMetadata(binlogPath string, logger logr.Logger) (*BinlogMetadata, 
 	}); err != nil {
 		return nil, fmt.Errorf("error getting binlog metadata: %v", err)
 	}
+	meta.FirstGtids = sortedGtidsByDomain(firstGtidByDomain)
+	meta.LastGtids = sortedGtidsByDomain(lastGtidByDomain)
 
 	if rawFormatDescriptionEvent != nil {
 		formatDescription := &replication.FormatDescriptionEvent{}
@@ -359,7 +445,6 @@ func GetBinlogMetadata(binlogPath string, logger logr.Logger) (*BinlogMetadata, 
 		}
 		prevGtids := make([]*mariadbrepl.Gtid, len(listEvent.GTIDs))
 		for i, gtid := range listEvent.GTIDs {
-			// TODO: support multiple GTID domain IDs
 			gtid, err := toMariadbGtid(&gtid)
 			if err != nil {
 				return nil, err
@@ -369,32 +454,24 @@ func GetBinlogMetadata(binlogPath string, logger logr.Logger) (*BinlogMetadata, 
 		meta.PreviousGtids = prevGtids
 	}
 
-	if firstRawGtidEvent != nil {
-		firstGtid, err := decodeGTIDEvent(firstRawGtidEvent, meta.ServerId)
-		if err != nil {
-			return nil, fmt.Errorf("error decoding first GTID event: %v", err)
-		}
-		// TODO: support multiple GTID domain IDs
-		gtid, err := toMariadbGtid(&firstGtid.GTID)
-		if err != nil {
-			return nil, err
-		}
-		meta.FirstGtid = gtid
-	}
-	if lastRawGtidEvent != nil {
-		lastGtid, err := decodeGTIDEvent(lastRawGtidEvent, meta.ServerId)
-		if err != nil {
-			return nil, fmt.Errorf("error decoding last GTID event: %v", err)
-		}
-		// TODO: support multiple GTID domain IDs
-		gtid, err := toMariadbGtid(&lastGtid.GTID)
-		if err != nil {
-			return nil, err
-		}
-		meta.LastGtid = gtid
-	}
-
 	return &meta, nil
+}
+
+func sortedGtidsByDomain(gtidsByDomain map[uint32]*mariadbrepl.Gtid) []*mariadbrepl.Gtid {
+	if len(gtidsByDomain) == 0 {
+		return nil
+	}
+	domains := make([]uint32, 0, len(gtidsByDomain))
+	for domain := range gtidsByDomain {
+		domains = append(domains, domain)
+	}
+	sort.Slice(domains, func(i, j int) bool { return domains[i] < domains[j] })
+
+	gtids := make([]*mariadbrepl.Gtid, len(domains))
+	for i, domain := range domains {
+		gtids[i] = gtidsByDomain[domain]
+	}
+	return gtids
 }
 
 func decodeGTIDEvent(rawEvent []byte, serverId uint32) (*replication.MariadbGTIDEvent, error) {

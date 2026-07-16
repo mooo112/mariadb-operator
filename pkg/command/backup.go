@@ -29,7 +29,7 @@ type BackupOpts struct {
 	OmitCredentials      bool
 	CleanupTargetFile    bool
 	MaxRetentionDuration time.Duration
-	StartGtid            *replication.Gtid
+	StartGtid            replication.GtidSet
 	TargetTime           time.Time
 	Compression          mariadbv1alpha1.CompressAlgorithm
 	LogLevel             string
@@ -92,7 +92,7 @@ func WithMaxRetention(d time.Duration) BackupOpt {
 	}
 }
 
-func WithStartGtid(gtid *replication.Gtid) BackupOpt {
+func WithStartGtid(gtid replication.GtidSet) BackupOpt {
 	return func(bo *BackupOpts) {
 		bo.StartGtid = gtid
 	}
@@ -477,7 +477,7 @@ fi`
 }
 
 func (b *BackupCommand) MariadbOperatorPITR(strictMode bool) (*Command, error) {
-	if b.StartGtid == nil {
+	if len(b.StartGtid) == 0 {
 		return nil, errors.New("startGtid must be set")
 	}
 	args := []string{
@@ -590,7 +590,7 @@ func (b *BackupCommand) mariadbDumpArgs(backup *mariadbv1alpha1.Backup, mariadb 
 }
 
 func (b *BackupCommand) mariadbBinlogArgs(mariadb *mariadbv1alpha1.MariaDB) ([]string, error) {
-	if b.StartGtid == nil {
+	if len(b.StartGtid) == 0 {
 		return nil, errors.New("startGtid must be set")
 	}
 	connFlags, err := ConnectionFlags(&b.CommandOpts, mariadb)
@@ -607,10 +607,13 @@ func (b *BackupCommand) mariadbBinlogArgs(mariadb *mariadbv1alpha1.MariaDB) ([]s
 	return []string{
 		"set -euo pipefail",
 		"echo 💾 Restoring binlogs",
-		// TODO: pass multiple --start-position
+		// --start-position accepts a comma-separated GTID list (one GTID per domain) since
+		// MariaDB 10.8: the full multi-domain position is passed so that no domain's events
+		// are replayed from the beginning.
 		// See:
 		// https://mariadb.com/docs/server/clients-and-utilities/logging-tools/mariadb-binlog/mariadb-binlog-options#j-pos-start-position-pos
-		// https://jira.mariadb.org/browse/MDEV-37231
+		// Caveat: within a domain, mariadb-binlog matches by sequence number only (it ignores
+		// the server ID part), see https://jira.mariadb.org/browse/MDEV-37231
 		// Note:
 		// mariadb-binlog assumes the same timezone as the OS where it runs.
 		// Here we enforce UTC and use a format compatible with the server.

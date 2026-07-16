@@ -3751,8 +3751,8 @@ func getVolumeSource(name string, job *v1.Job) *corev1.VolumeSource {
 	return nil
 }
 
-func mustParseGtid(t *testing.T, rawGtid string) *replication.Gtid {
-	gtid, err := replication.ParseGtid(rawGtid)
+func mustParseGtid(t *testing.T, rawGtid string) replication.GtidSet {
+	gtid, err := replication.ParseGtidSet(rawGtid)
 	if err != nil {
 		t.Fatalf("unexpected error parsing GTID: %v", err)
 	}
